@@ -5,77 +5,74 @@ import numpy as np
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 
-BASE = "https://fapi.binance.com"
+BASE = "https://www.okx.com"
 TIMEOUT = 12
 
 st.set_page_config(page_title="Crypto Futures Scanner", page_icon="📈", layout="wide")
 
 
+
 @st.cache_data(ttl=60)
 def get_universe(limit=50):
-    try:
-        session = requests.Session()
-        session.headers.update({
-            "User-Agent": "Mozilla/5.0 CryptoScanner/1.0"
-        })
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 CryptoScanner/1.0"
+    })
 
-        # دریافت اطلاعات قراردادهای فیوچرز
-        r = session.get(
-            f"{BASE}/fapi/v1/exchangeInfo",
-            timeout=TIMEOUT
-        )
-        r.raise_for_status()
-        info = r.json()
+    # Get active USDT perpetual swap instruments
+    r = session.get(
+        f"{BASE}/api/v5/public/instruments",
+        params={"instType": "SWAP"},
+        timeout=TIMEOUT
+    )
+    r.raise_for_status()
+    info = r.json()
 
-        if not isinstance(info, dict) or "symbols" not in info:
-            raise RuntimeError(
-                f"Binance exchangeInfo error: {info}"
-            )
+    if info.get("code") != "0":
+        raise RuntimeError(f"OKX instruments error: {info}")
 
-        # دریافت حجم معاملات 24 ساعته
-        r = session.get(
-            f"{BASE}/fapi/v1/ticker/24hr",
-            timeout=TIMEOUT
-        )
-        r.raise_for_status()
-        tickers = r.json()
+    eligible = {
+        s["instId"]
+        for s in info.get("data", [])
+        if s.get("state") == "live"
+        and s.get("settleCcy") == "USDT"
+        and s.get("ctType") == "linear"
+        and s.get("instId", "").endswith("-USDT-SWAP")
+    }
 
-        if not isinstance(tickers, list):
-            raise RuntimeError(
-                f"Binance ticker error: {tickers}"
-            )
+    # Get 24-hour ticker data
+    r = session.get(
+        f"{BASE}/api/v5/market/tickers",
+        params={"instType": "SWAP"},
+        timeout=TIMEOUT
+    )
+    r.raise_for_status()
+    tickers = r.json()
 
-        eligible = {
-            s["symbol"]
-            for s in info["symbols"]
-            if s.get("status") == "TRADING"
-            and s.get("contractType") == "PERPETUAL"
-            and s.get("quoteAsset") == "USDT"
-        }
+    if tickers.get("code") != "0":
+        raise RuntimeError(f"OKX ticker error: {tickers}")
 
-        rows = [
-            x for x in tickers
-            if x.get("symbol") in eligible
-        ]
+    rows = [
+        x for x in tickers.get("data", [])
+        if x.get("instId") in eligible
+    ]
 
-        rows.sort(
-            key=lambda x: float(x.get("quoteVolume", 0)),
-            reverse=True
-        )
+    rows.sort(
+        key=lambda x: float(
+            x.get("volCcy24h") or x.get("vol24h") or 0
+        ),
+        reverse=True
+    )
 
-        result = [x["symbol"] for x in rows[:limit]]
+    result = [x["instId"] for x in rows[:limit]]
 
-        if not result:
-            raise RuntimeError(
-                "No active USDT perpetual markets found."
-            )
-
-        return result
-
-    except requests.RequestException as e:
+    if not result:
         raise RuntimeError(
-            f"Binance connection error: {e}"
-        ) from e
+            "No active USDT perpetual markets found on OKX."
+        )
+
+    return result
+
 
 
 @st.cache_data(ttl=20)
