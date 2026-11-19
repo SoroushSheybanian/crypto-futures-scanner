@@ -10,20 +10,73 @@ TIMEOUT = 12
 
 st.set_page_config(page_title="Crypto Futures Scanner", page_icon="📈", layout="wide")
 
+
 @st.cache_data(ttl=60)
 def get_universe(limit=50):
-    info = requests.get(f"{BASE}/fapi/v1/exchangeInfo", timeout=TIMEOUT).json()
-    tickers = requests.get(f"{BASE}/fapi/v1/ticker/24hr", timeout=TIMEOUT).json()
-    eligible = {
-        s["symbol"] for s in info["symbols"]
-        if s.get("status") == "TRADING"
-        and s.get("contractType") == "PERPETUAL"
-        and s.get("quoteAsset") == "USDT"
-        and s.get("symbol", "").endswith("USDT")
-    }
-    rows = [x for x in tickers if x.get("symbol") in eligible]
-    rows.sort(key=lambda x: float(x.get("quoteVolume", 0)), reverse=True)
-    return [x["symbol"] for x in rows[:limit]]
+    try:
+        session = requests.Session()
+        session.headers.update({
+            "User-Agent": "Mozilla/5.0 CryptoScanner/1.0"
+        })
+
+        # دریافت اطلاعات قراردادهای فیوچرز
+        r = session.get(
+            f"{BASE}/fapi/v1/exchangeInfo",
+            timeout=TIMEOUT
+        )
+        r.raise_for_status()
+        info = r.json()
+
+        if not isinstance(info, dict) or "symbols" not in info:
+            raise RuntimeError(
+                f"Binance exchangeInfo error: {info}"
+            )
+
+        # دریافت حجم معاملات 24 ساعته
+        r = session.get(
+            f"{BASE}/fapi/v1/ticker/24hr",
+            timeout=TIMEOUT
+        )
+        r.raise_for_status()
+        tickers = r.json()
+
+        if not isinstance(tickers, list):
+            raise RuntimeError(
+                f"Binance ticker error: {tickers}"
+            )
+
+        eligible = {
+            s["symbol"]
+            for s in info["symbols"]
+            if s.get("status") == "TRADING"
+            and s.get("contractType") == "PERPETUAL"
+            and s.get("quoteAsset") == "USDT"
+        }
+
+        rows = [
+            x for x in tickers
+            if x.get("symbol") in eligible
+        ]
+
+        rows.sort(
+            key=lambda x: float(x.get("quoteVolume", 0)),
+            reverse=True
+        )
+
+        result = [x["symbol"] for x in rows[:limit]]
+
+        if not result:
+            raise RuntimeError(
+                "No active USDT perpetual markets found."
+            )
+
+        return result
+
+    except requests.RequestException as e:
+        raise RuntimeError(
+            f"Binance connection error: {e}"
+        ) from e
+
 
 @st.cache_data(ttl=20)
 def get_klines(symbol, interval, limit=240):
