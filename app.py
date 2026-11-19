@@ -75,20 +75,64 @@ def get_universe(limit=50):
 
 
 
+
 @st.cache_data(ttl=20)
 def get_klines(symbol, interval, limit=240):
     r = requests.get(
-        f"{BASE}/fapi/v1/klines",
-        params={"symbol": symbol, "interval": interval, "limit": limit},
-        timeout=TIMEOUT,
+        f"{BASE}/api/v5/market/candles",
+        params={
+            "instId": symbol,
+            "bar": interval,
+            "limit": min(limit, 300)
+        },
+        timeout=TIMEOUT
     )
     r.raise_for_status()
-    cols = ["open_time","open","high","low","close","volume","close_time",
-            "quote_volume","trades","taker_base","taker_quote","ignore"]
-    df = pd.DataFrame(r.json(), columns=cols)
-    for c in ["open","high","low","close","volume"]:
+
+    result = r.json()
+
+    if result.get("code") != "0":
+        raise RuntimeError(
+            f"OKX candles error: {result}"
+        )
+
+    data = result.get("data", [])
+
+    if not data:
+        raise RuntimeError(
+            f"No candle data returned for {symbol}"
+        )
+
+    cols = [
+        "open_time", "open", "high", "low",
+        "close", "volume", "vol_currency",
+        "vol_quote", "confirm"
+    ]
+
+    df = pd.DataFrame(data, columns=cols)
+
+    df["open_time"] = pd.to_numeric(
+        df["open_time"], errors="coerce"
+    )
+
+    for c in ["open", "high", "low", "close", "volume"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    # OKX returns newest candles first.
+    # Sort oldest to newest.
+    df = df.sort_values("open_time").reset_index(drop=True)
+
+    df = df.dropna(
+        subset=["open", "high", "low", "close", "volume"]
+    )
+
+    if len(df) < 200:
+        raise RuntimeError(
+            f"Not enough candles for indicators: {symbol}"
+        )
+
     return df
+
 
 def indicators(df):
     d = df.copy()
