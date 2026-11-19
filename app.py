@@ -134,76 +134,219 @@ def get_klines(symbol, interval, limit=240):
     return df
 
 
+
 def indicators(df):
     d = df.copy()
+
     d["ema20"] = d.close.ewm(span=20, adjust=False).mean()
     d["ema50"] = d.close.ewm(span=50, adjust=False).mean()
     d["ema200"] = d.close.ewm(span=200, adjust=False).mean()
+
     delta = d.close.diff()
     gain = delta.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
     loss = (-delta.clip(upper=0)).ewm(alpha=1/14, adjust=False).mean()
+
     rs = gain / loss.replace(0, np.nan)
     d["rsi"] = 100 - (100 / (1 + rs))
+
     fast = d.close.ewm(span=12, adjust=False).mean()
     slow = d.close.ewm(span=26, adjust=False).mean()
+
     d["macd"] = fast - slow
     d["macd_signal"] = d.macd.ewm(span=9, adjust=False).mean()
+
+    # ATR and ADX
+    prev_close = d.close.shift(1)
+
+    tr = pd.concat([
+        d.high - d.low,
+        (d.high - prev_close).abs(),
+        (d.low - prev_close).abs()
+    ], axis=1).max(axis=1)
+
+    plus_dm = d.high.diff()
+    minus_dm = -d.low.diff()
+
+    plus_dm = plus_dm.where(
+        (plus_dm > minus_dm) & (plus_dm > 0), 0
+    )
+    minus_dm = minus_dm.where(
+        (minus_dm > plus_dm) & (minus_dm > 0), 0
+    )
+
+    atr = tr.ewm(alpha=1/14, adjust=False).mean()
+
+    plus_di = 100 * plus_dm.ewm(
+        alpha=1/14, adjust=False
+    ).mean() / atr.replace(0, np.nan)
+
+    minus_di = 100 * minus_dm.ewm(
+        alpha=1/14, adjust=False
+    ).mean() / atr.replace(0, np.nan)
+
+    dx = 100 * (plus_di - minus_di).abs() / (
+        plus_di + minus_di
+    ).replace(0, np.nan)
+
+    d["adx"] = dx.ewm(
+        alpha=1/14, adjust=False
+    ).mean()
+
+    d["atr"] = atr
     d["vol_avg"] = d.volume.rolling(20).mean()
+    d["vol_ratio"] = d.volume / d.vol_avg.replace(0, np.nan)
+
     return d
+
+
 
 def timeframe_bias(symbol, interval):
     d = indicators(get_klines(symbol, interval))
-    # Ignore the currently forming candle.
-    x = d.iloc[-2]
-    bullish = x.close > x.ema20 > x.ema50 and x.macd > x.macd_signal and 50 <= x.rsi <= 72
-    bearish = x.close < x.ema20 < x.ema50 and x.macd < x.macd_signal and 28 <= x.rsi <= 50
+
+    # Use confirmed candles only when OKX supplies confirmation.
+    if "confirm" in d.columns:
+        d = d[d["confirm"].astype(str) == "1"]
+
+    if len(d) < 200:
+        raise ValueError("Not enough confirmed candles")
+
+    x = d.iloc[-1]
+
+    bullish = (
+        x.close > x.ema20 > x.ema50
+        and x.macd > x.macd_signal
+        and 50 <= x.rsi <= 72
+    )
+
+    bearish = (
+        x.close < x.ema20 < x.ema50
+        and x.macd < x.macd_signal
+        and 28 <= x.rsi <= 50
+    )
+
     if bullish:
         return "Bullish", x
     if bearish:
         return "Bearish", x
+
     return "Neutral", x
+
+
 
 def analyze(symbol):
     try:
         b5, x5 = timeframe_bias(symbol, "5m")
         b15, x15 = timeframe_bias(symbol, "15m")
+
         direction = "WAIT"
+        score = 0
+
         if b5 == "Bullish" and b15 == "Bullish":
             direction = "LONG"
         elif b5 == "Bearish" and b15 == "Bearish":
             direction = "SHORT"
 
+        if direction != "WAIT":
+            score = 30
+
+            # EMA200 trend confirmation
+            if direction == "LONG":
+                if x5.close > x5.ema200 and x15.close > x15.ema200:
+                    score += 20
+                if x5.rsi >= 55:
+                    score += 10
+            else:
+                if x5.close < x5.ema200 and x15.close < x15.ema200:
+                    score += 20
+                if x5.rsi <= 45:
+                    score += 10
+
+            # ADX trend strength
+            if x5.adx >= 20 and x15.adx >= 20:
+                score += 15
+            elif x5.adx >= 20 or x15.adx >= 20:
+                score += 8
+
+            # Volume confirmation
+            if pd.notna(x5.vol_ratio) and x5.vol_ratio >= 1.2:
+                score += 10
+
+            # MACD momentum
+            if direction == "LONG" and x5.macd > 0:
+                score += 5
+            elif direction == "SHORT" and x5.macd < 0:
+                score += 5
+
+        # Balanced strategy: minimum score 65
+        if score < 65:
+            direction = "WAIT"
+
         price = float(x5.close)
-        # ATR-based stop and targets using closed M5 candles.
-        d = indicators(get_klines(symbol, "5m"))
-        d["tr"] = np.maximum(d.high-d.low,
-                    np.maximum((d.high-d.close.shift()).abs(), (d.low-d.close.shift()).abs()))
-        atr = float(d.tr.rolling(14).mean().iloc[-2])
+        atr = float(x5.atr)
+
         if not np.isfinite(atr) or atr <= 0:
             atr = price * 0.005
 
         if direction == "LONG":
             sl = price - 1.5 * atr
             risk = price - sl
-            tps = [price + risk, price + 2*risk, price + 3*risk]
+            tps = [
+                price + risk,
+                price + 2 * risk,
+                price + 3 * risk
+            ]
+
         elif direction == "SHORT":
             sl = price + 1.5 * atr
             risk = sl - price
-            tps = [price - risk, price - 2*risk, price - 3*risk]
+            tps = [
+                price - risk,
+                price - 2 * risk,
+                price - 3 * risk
+            ]
+
         else:
-            sl, tps = np.nan, [np.nan]*3
+            sl = np.nan
+            tps = [np.nan] * 3
 
         return {
-            "Symbol": symbol, "Price": price, "M5": b5, "M15": b15,
-            "Signal": direction, "Entry": price, "Stop Loss": sl,
-            "TP1": tps[0], "TP2": tps[1], "TP3": tps[2],
-            "Updated": pd.Timestamp.utcnow().strftime("%H:%M:%S UTC"), "Error": ""
+            "Symbol": symbol,
+            "Price": price,
+            "M5": b5,
+            "M15": b15,
+            "Signal": direction,
+            "Score": score,
+            "ADX": round(float(x5.adx), 2),
+            "Volume Ratio": round(float(x5.vol_ratio), 2)
+                if pd.notna(x5.vol_ratio) else np.nan,
+            "Entry": price,
+            "Stop Loss": sl,
+            "TP1": tps[0],
+            "TP2": tps[1],
+            "TP3": tps[2],
+            "Updated": pd.Timestamp.utcnow().strftime("%H:%M:%S UTC"),
+            "Error": ""
         }
+
     except Exception as e:
-        return {"Symbol": symbol, "Price": np.nan, "M5": "-", "M15": "-",
-                "Signal": "ERROR", "Entry": np.nan, "Stop Loss": np.nan,
-                "TP1": np.nan, "TP2": np.nan, "TP3": np.nan,
-                "Updated": "-", "Error": str(e)[:100]}
+        return {
+            "Symbol": symbol,
+            "Price": np.nan,
+            "M5": "-",
+            "M15": "-",
+            "Signal": "ERROR",
+            "Score": 0,
+            "ADX": np.nan,
+            "Volume Ratio": np.nan,
+            "Entry": np.nan,
+            "Stop Loss": np.nan,
+            "TP1": np.nan,
+            "TP2": np.nan,
+            "TP3": np.nan,
+            "Updated": "-",
+            "Error": str(e)[:150]
+        }
+
 
 st.title("📈 Crypto Futures Scanner")
 st.caption("Binance USDⓈ-M perpetuals · Public market data · Signal-only prototype")
@@ -234,9 +377,17 @@ try:
     c2.metric("Long signals", int((df.Signal == "LONG").sum()))
     c3.metric("Short signals", int((df.Signal == "SHORT").sum()))
     c4.metric("Selected leverage", f"{leverage}x")
+    st.metric(
+    "Strong signals",
+    int(((df.Score >= 80) & (df.Signal != "ERROR")).sum())
+)
 
     st.subheader("Market overview")
-    view = df[["Symbol","Price","M5","M15","Signal","Entry","Stop Loss","TP1","TP2","TP3","Updated"]].copy()
+    view = df[[
+    "Symbol", "Price", "M5", "M15", "Signal",
+    "Score", "ADX", "Volume Ratio",
+    "Entry", "Stop Loss", "TP1", "TP2", "TP3", "Updated"
+]].copy()
     st.dataframe(
         view,
         use_container_width=True,
